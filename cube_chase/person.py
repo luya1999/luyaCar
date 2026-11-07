@@ -1,12 +1,13 @@
-"""person.py —— 跑步的人。
+"""person.py —— 被跟随的跑者。
 
-两种模式（规则6）：
-- auto   ：沿跑道自动跑，遇到障碍自动侧移绕开（规则4），速度恒 5 m/s
+两种模式：
+- auto   ：沿跑道自动跑，遇到障碍/行人自动侧移绕开，合速度恒 5 m/s
 - manual ：WASD / 方向键控制方向，速度仍然恒 5 m/s（只改方向，不改快慢）
 
-对外的两个关键接口（供木块使用）：
-- follow_target()  ：沿"人真实走过的轨迹"往回退 81cm，得到木块该占的位置
-- future_route()   ：按人当前走向预测未来一串路点（规则3：提前定义未来路线）
+对外的两个关键接口（供机器狗使用）：
+- follow_target()  ：沿"跑者真实走过的轨迹"往回退 FOLLOW_DIST(260cm)，
+                     得到狗该占的位置（对应约 2m 身后间距）
+- future_route()   ：按跑者当前走向预测未来一串路点（提前定义未来路线）
 """
 
 import math
@@ -14,10 +15,11 @@ import math
 from . import config
 from .track import Track
 
-# 人 + 障碍都是半径 25cm，中心距要 ≥ 50cm 才算不碰；再留 8cm 余量
-PERSON_AVOID_GAP = 58.0
-PERSON_LOOKAHEAD = 340.0     # 提前多远开始侧移（cm）
-LATERAL_LIMIT = 70.0         # 最多偏出中心线多少（允许踩出跑道一点）
+# 侧移余量：按对方实际半径算（路锥 18cm / 行人 25cm 不一样）
+PERSON_AVOID_MARGIN = 15.0
+PERSON_LOOKAHEAD = 500.0     # 提前多远开始侧移（cm）。v0.3 的 340cm 在
+                             # 5m/s 下只有 0.68s，横穿行人来不及反应
+LATERAL_LIMIT = 100.0        # 最多偏出中心线多少（跑道半宽 120cm）
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -50,7 +52,7 @@ class Person:
             self.lateral = _clamp(self.lateral, -LATERAL_LIMIT, LATERAL_LIMIT)
             self.mode = "auto"
 
-    # ---------- 自动避障（规则4） ----------
+    # ---------- 自动避障 ----------
 
     def _desired_lateral(self, obstacles) -> float:
         """看前方一段路上有没有障碍，有就往它的反方向让。
@@ -58,16 +60,20 @@ class Person:
         障碍是"半探入"跑道的（中心 lateral 约 ±38cm），人沿中心线会碰上，
         必须往另一侧偏；障碍左右交错摆放，人就自然跑成 S 形，不能走直线。
         """
-        best_ds, best_lo = PERSON_LOOKAHEAD, None
+        best_ds, best = PERSON_LOOKAHEAD, None
         for o in obstacles:
             so, lo = self.track.frame(o.x, o.y)
             ds = (so - self.s) % self.track.total_length
-            if ds < best_ds and abs(lo) < 130.0:
-                best_ds, best_lo = ds, lo
-        if best_lo is None:
+            if ds < best_ds and abs(lo) < 150.0:
+                best_ds, best = ds, (lo, o.radius)
+        if best is None:
             return 0.0
-        sign = 1.0 if best_lo >= 0 else -1.0
-        need = max(45.0, PERSON_AVOID_GAP + 12.0 - abs(best_lo))
+        lo, radius = best
+        sign = 1.0 if lo >= 0 else -1.0
+        # 需要的中心距 = 人半径 + 对方半径 + 余量；按实际半径算，
+        # 不再对所有障碍统一写死 58cm
+        need = max(50.0, config.PERSON_RADIUS + radius
+                   + PERSON_AVOID_MARGIN - abs(lo))
         return _clamp(-sign * need, -LATERAL_LIMIT, LATERAL_LIMIT)
 
     # ---------- 步进 ----------
@@ -76,8 +82,8 @@ class Person:
         if self.mode == "auto":
             # "速度固定 5m/s" 指的是**合速率**恒定。绕障碍左右移动要花掉一部分
             # 速度，沿跑道前进的分量就变成 sqrt(500² - v_lat²)，人会明显变慢。
-            # 这正是规则3 的物理前提：木块走平滑最短路，不横移，同样 5m/s
-            # 全部用于前进，才能在不超速的前提下追上、并保持 30~40cm。
+            # 这是"巡航不超人速仍能跟上"的物理前提：机器狗走平滑最短路，
+            # 不横移，同样 5m/s 全部用于前进，才能补回绕障损失的距离。
             target_lat = self._desired_lateral(obstacles)
             v_lat = _clamp((target_lat - self.lateral) / dt,
                            -config.PERSON_LAT_RATE, config.PERSON_LAT_RATE)
@@ -108,12 +114,13 @@ class Person:
         if len(self.trail) > 120:
             self.trail = self.trail[-120:]
 
-    # ---------- 给木块用的接口 ----------
+    # ---------- 给机器狗用的接口 ----------
 
     def follow_target(self) -> tuple[float, float]:
-        """沿人走过的轨迹往回退 FOLLOW_DIST，得到"身后 30~40cm"的目标点。
+        """沿跑者走过的轨迹往回退 FOLLOW_DIST，得到"身后约 2m"的目标点。
 
-        用轨迹而不是"沿当前朝向退一段"，是为了弯道上也严格落在人实际走过的路上。
+        用轨迹而不是"沿当前朝向退一段"，是为了弯道上也严格落在跑者
+        实际走过的路上，不会切进内场。
         """
         trail = self.trail
         back = config.FOLLOW_DIST + config.FOLLOW_BIAS
